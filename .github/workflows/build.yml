@@ -147,6 +147,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: packages/*.ipa
+          files: packages/*.deb
           tag_name: v${{ steps.ipa_info.outputs.version }}-${{ steps.package_info.outputs.version }}
           body: ${{ steps.hash_files.outputs.hashes }}
