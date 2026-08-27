@@ -3,6 +3,15 @@ name: CI
 on:
   push:
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Build IPA and create draft release"
+        default: false
+        type: boolean
+      ipa_url:
+        description: "Direct URL to Decrypted IPA file"
+        type: string
+        required: false
 
 jobs:
   build:
@@ -16,19 +25,51 @@ jobs:
       - name: Get package info
         id: package_info
         run: |
-          version=$(grep "PACKAGE_VERSION =" Makefile | cut -d' ' -f3)
-
-          if [ -z "$version" ]; then
-            version=$(grep "Version:" control | cut -d' ' -f2)
+          version=$(cat Makefile | grep "PACKAGE_VERSION =" | cut -d' ' -f3)
+          if [ -z $version ]; then
+            version=$(cat control | grep "Version:" | cut -d' ' -f2)
           fi
-
-          echo "id=$(grep "Package:" control | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "id=$(cat control | grep "Package:" | cut -d' ' -f2)" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
 
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y rsync
+
+      - name: Install theos-jailed dependencies
+        if: ${{ inputs.create_release }}
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential checkinstall git autoconf automake libtool-bin llvm xmlstarlet
+          curl -L https://github.com/libimobiledevice/libplist/releases/download/2.6.0/libplist-2.6.0.tar.bz2 | bzip2 -d | tar -x
+          cd libplist*
+          ./configure
+          sudo make install
+          sudo ldconfig
+
+      - name: Download IPA (Auto)
+        if: ${{ inputs.create_release && !inputs.ipa_url }}
+        uses: level3tjg/decryptedappstore-action@main
+        with:
+          appstore_url: "https://apps.apple.com/us/app/reddit/id1064216828"
+          cache: true
+          path: ${{ github.workspace }}/App.ipa
+          token: ${{ secrets.DECRYPTEDAPPSTORE_SESSION_TOKEN }}
+
+      - name: Download IPA (Manual)
+        if: ${{ inputs.create_release && inputs.ipa_url }}
+        run: |
+          curl -Lo "${{ github.workspace }}/App.ipa" "${{ inputs.ipa_url }}"
+          zip -T "${{ github.workspace }}/App.ipa"
+
+      - name: Get IPA Info
+        if: ${{ inputs.create_release }}
+        id: ipa_info
+        run: |
+          info=$(unzip -p "${{ github.workspace }}/App.ipa" Payload/*.app/Info.plist)
+          echo "bundle-id=$(echo $info | xmlstarlet sel -t -v "/plist/dict/key[text()=\"CFBundleIdentifier\"]/following-sibling::*[1]/text()")" >> $GITHUB_OUTPUT
+          echo "version=$(echo $info | xmlstarlet sel -t -v "/plist/dict/key[text()=\"CFBundleShortVersionString\"]/following-sibling::*[1]/text()")" >> $GITHUB_OUTPUT
 
       - name: Setup theos
         uses: level3tjg/theos-action@main
@@ -37,50 +78,57 @@ jobs:
           cache-dir-theos: ${{ github.workspace }}/theos
           cache-dir-sdks: ${{ github.workspace }}/theos/sdks
 
-      - name: Set Debug Variables
-        id: debug_vars
+      - name: Checkout theos-jailed
+        if: ${{ inputs.create_release }}
+        uses: actions/checkout@v4
+        with:
+          repository: level3tjg/theos-jailed
+          path: theos-jailed
+          submodules: recursive
+
+      - name: Install theos-jailed
+        if: ${{ inputs.create_release }}
         run: |
-          if [ "${{ github.ref_name }}" == "main" ]; then
-            echo "Building on main: Debug Menu OFF"
-            echo "cflags=-DREDDITFILTER_DEBUG=0" >> "$GITHUB_OUTPUT"
-          else
-            echo "Building on ${{ github.ref_name }}: Debug Menu ON"
-            echo "cflags=-DREDDITFILTER_DEBUG=1" >> "$GITHUB_OUTPUT"
-          fi
+          ./theos-jailed/install
 
       - name: Build rootless deb
         run: make package
         env:
-          FINALPACKAGE: 1
+          FINALPACKAGE: ${{ inputs.create_release }}
           THEOS_PACKAGE_SCHEME: rootless
-          ADDITIONAL_CFLAGS: ${{ steps.debug_vars.outputs.cflags }}
 
       - name: Build rootful deb
         run: make clean package
         env:
-          FINALPACKAGE: 1
-          ADDITIONAL_CFLAGS: ${{ steps.debug_vars.outputs.cflags }}
+          FINALPACKAGE: ${{ inputs.create_release }}
 
-      - name: List packages
-        run: |
-          echo "Built packages:"
-          ls -lh packages/
+      - name: Build IPA
+        if: ${{ inputs.create_release }}
+        run: make package
+        env:
+          FINALPACKAGE: 1
+          SIDELOADED: 1
+          IPA: ${{ github.workspace }}/App.ipa
+          APP_VERSION: ${{ steps.ipa_info.outputs.version }}
 
       - name: Hash release files
         id: hash_files
         run: |
-          echo 'hashes<<EOF' >> "$GITHUB_OUTPUT"
-          sha256sum packages/*.deb >> "$GITHUB_OUTPUT"
-          echo 'EOF' >> "$GITHUB_OUTPUT"
+          echo 'hashes<<EOF' >> $GITHUB_OUTPUT
+          echo "$(sha256sum packages/*)" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_info.outputs.id }}_${{ steps.package_info.outputs.version }}
+          path: packages/*
 
       - name: Create release
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        if: ${{ inputs.create_release }}
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: packages/*.deb
-          tag_name: v${{ steps.package_info.outputs.version }}
-          body: |
-            ## SHA256
-
-            ${{ steps.hash_files.outputs.hashes }}
+          files: packages/*
+          tag_name: v${{ steps.ipa_info.outputs.version }}-${{ steps.package_info.outputs.version }}
+          body: ${{ steps.hash_files.outputs.hashes }}
